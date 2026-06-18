@@ -68,7 +68,6 @@ sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk /Library/Java/Java
 ### 2. Create the virtual environment
 
 ```bash
-cd /Users/hincaltopcuoglu/Desktop/streaming
 python3 -m venv venv
 source venv/bin/activate
 ```
@@ -106,7 +105,6 @@ You need **two terminals**.
 ### Terminal 1 — Start the Spark streaming query
 
 ```bash
-cd /Users/hincaltopcuoglu/Desktop/streaming
 source venv/bin/activate
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 python3 run_spark.py
@@ -117,7 +115,6 @@ Spark will start, download the Kafka connector on first run (~50MB), and begin p
 ### Terminal 2 — Send events continuously
 
 ```bash
-cd /Users/hincaltopcuoglu/Desktop/streaming
 source venv/bin/activate
 python3 sent_events.py     # send one round (8 events)
 ```
