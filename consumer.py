@@ -1,5 +1,6 @@
 import json
 from kafka import KafkaConsumer
+from factory import EventFactory
 
 class EventConsumer:
     def __init__(self, bootstrap_servers = "localhost:9092", topic = "clickstream", group_id = "stream-learners-test-2"):
@@ -15,7 +16,7 @@ class EventConsumer:
                             )
 
     
-    def poll_one(self):
+    def poll_one(self, as_object = False):
         records = self.consumer.poll(timeout_ms=1000)
 
         for partition, messages in records.items():
@@ -23,8 +24,11 @@ class EventConsumer:
                 msg = messages[0]
                 text = msg.value.decode("utf-8")
                 data = json.loads(text)
-
-                return data
+                
+                if as_object:
+                    return EventFactory.from_dict(data)
+                else:
+                    return data
         return None
 
     def close(self):
