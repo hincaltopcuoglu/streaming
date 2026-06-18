@@ -28,7 +28,7 @@ class OnlinePurchasePredictor:
     def __init__(self):
         self.model = None
         self.assembler = VectorAssembler(
-            inputCols=["clicks_in_session"],
+            inputCols=["clicks_in_session", "time_on_page"],
             outputCol="features"
         )
         self.lr = LogisticRegression(

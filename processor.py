@@ -11,12 +11,12 @@ class StreamProcessor:
             .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1") \
             .getOrCreate()
 
-    def read_stream(self):
+    def read_stream(self, topic="clickstream_v2"):
         return self.spark.readStream \
             .format("kafka") \
             .option("kafka.bootstrap.servers", "localhost:9092") \
-            .option("subscribe", "clickstream_v2") \
-            .option("startingOffsets", "earliest") \
+            .option("subscribe", topic) \
+            .option("startingOffsets", "latest") \
             .load()
 
     def parse_events(self, df):
