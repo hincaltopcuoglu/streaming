@@ -38,6 +38,7 @@ Each micro-batch triggers the full pipeline: Spark reads events from Kafka, pars
 | `processor.py` | `StreamProcessor` — Spark session, reads Kafka stream, parses JSON into typed DataFrame columns, exposes aggregations |
 | `model.py` | `OnlinePurchasePredictor` — logistic regression trained per batch with windowed session features |
 | `sent_events.py` | Test script: sends a mix of clicks and purchases to Kafka |
+| `loadtest.py` | High-throughput async load test — 4 threads × 4 aiokafka producers = 16 concurrent senders, generates 5 GB of realistic clickstream data on-the-fly |
 | `run_spark.py` | Main entry point — wires the Spark stream into the model with `foreachBatch` and prints live metrics |
 | `docker-compose.yml` | Kafka and Zookeeper containers |
 | `.gitignore` | Excludes `venv/`, `__pycache__/`, etc. |
@@ -76,10 +77,12 @@ source venv/bin/activate
 
 ```bash
 pip install --upgrade pip
-pip install kafka-python pyspark==3.5.1 setuptools
+pip install kafka-python pyspark==3.5.1 setuptools aiokafka
 ```
 
 > `setuptools` is needed because PySpark 3.5.1 imports `distutils`, which was removed from Python 3.12+. `setuptools` provides a vendored `distutils` shim.
+>
+> `aiokafka` is used by `loadtest.py` for the high-throughput async producer.
 
 ### 4. Start Kafka and Zookeeper
 
@@ -90,9 +93,19 @@ docker ps  # confirm both containers are running
 
 ### 5. Create the Kafka topic
 
+For the small `sent_events.py` test pipeline:
+
 ```bash
 docker exec -it $(docker ps --format '{{.Names}}' | grep kafka) \
     kafka-topics --create --topic clickstream_v2 \
+    --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+```
+
+For the high-throughput load test (recommended, 1 partition is enough — the model trains on the whole stream at once):
+
+```bash
+docker exec -it $(docker ps --format '{{.Names}}' | grep kafka) \
+    kafka-topics --create --topic clickstream_loadtest \
     --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
 ```
 
@@ -100,26 +113,33 @@ docker exec -it $(docker ps --format '{{.Names}}' | grep kafka) \
 
 ## Running the Pipeline
 
-You need **two terminals**.
+You need **two terminals** for either the small or large pipeline.
 
 ### Terminal 1 — Start the Spark streaming query
 
 ```bash
 source venv/bin/activate
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)
-python3 run_spark.py
+export PYSPARK_GATEWAY_TIMEOUT=300
+python3 run_spark.py clickstream_loadtest    # for the load test
+# OR
+python3 run_spark.py                         # defaults to clickstream_v2
 ```
 
-Spark will start, download the Kafka connector on first run (~50MB), and begin polling Kafka every 10 seconds. The first batch processes any historical events already in the topic.
+Spark will start, download the Kafka connector on first run (~50MB), and begin polling Kafka every 10 seconds.
 
-### Terminal 2 — Send events continuously
+The `PYSPARK_GATEWAY_TIMEOUT=300` setting gives the JVM 5 minutes to start (the 60s default is sometimes too short on slower systems). `startingOffsets=latest` is used in the load test pipeline so Spark only sees events produced from the moment it starts, not historical data.
+
+### Terminal 2 — Send events
+
+**Option A — Small test pipeline (a few events at a time):**
 
 ```bash
 source venv/bin/activate
-python3 sent_events.py     # send one round (8 events)
+python3 sent_events.py
 ```
 
-Or run a continuous loop:
+Or run it in a loop:
 
 ```bash
 while true; do
@@ -128,27 +148,47 @@ while true; do
 done
 ```
 
+**Option B — High-throughput load test (~9 MB/s, ~85k events/s):**
+
+```bash
+source venv/bin/activate
+python3 loadtest.py
+```
+
+This generates 5 GB of realistic clickstream data on-the-fly. The data has real predictive signal: sessions with more events are more likely to end in a purchase, so the model learns a non-zero coefficient for `clicks_in_session`. See `loadtest.py` for tunable parameters (target bytes, threads, sessions, purchase rate).
+
 ---
 
 ## Sample Output
 
+With the high-throughput load test producing realistic sessions:
+
 ```
 ============================================================
-Batch 0  |  events: 79
+Batch 0  |  events: 1,800
 ============================================================
-Accuracy on this batch: 0.781
+Accuracy on this batch: 0.676
 Feature importances (coefficients):
-  clicks_in_session          +0.8328  ########
-  time_on_page               -0.0123  #
+  clicks_in_session         +0.1234  #
+  time_on_page              +0.0000
+  __intercept__             -0.9069  (baseline p=0.288)
 
 ============================================================
-Batch 1  |  events: 24
+Batch 1  |  events: 193,400
 ============================================================
-Accuracy on this batch: 0.750
+Accuracy on this batch: 0.680
 Feature importances (coefficients):
-  clicks_in_session          +0.7821  #######
-  time_on_page               +0.0098
+  clicks_in_session         +0.0450
+  time_on_page              -0.0925
+  __intercept__             -0.9972  (baseline p=0.269)
 ```
+
+What this tells you:
+
+- **`clicks_in_session` is positive**: more events in a session → more likely to purchase. The model learned this from the data, where the load test makes purchase probability scale with session length.
+- **`time_on_page` is negative**: long gaps between events → less likely to purchase. Events cluster within sessions, so this is anti-correlated with the positive class.
+- **`__intercept__` is the baseline**: `sigmoid(intercept)` ≈ actual purchase rate in the batch. The model uses this to capture the class imbalance on top of the feature signal.
+- **Accuracy around 0.68** is a real prediction accuracy, not "always predict majority class". The data has substantial noise, so this is close to the realistic ceiling.
 
 The model retrains on every batch, and the coefficients update to reflect the patterns in the most recent events. That is online learning in action.
 
@@ -201,12 +241,28 @@ The windowed aggregation makes the features meaningful: each event's `clicks_in_
 
 Wires everything together with `foreachBatch`. Each micro-batch:
 
-1. Trains a fresh logistic regression model
-2. Extracts feature coefficients (as plain Python floats)
-3. Computes accuracy using a manual sigmoid (avoids Spark serialization issues inside `foreachBatch`)
-4. Prints a clean summary with visual bars for coefficient magnitudes
+1. Skips the batch if it has only one class (LogisticRegression needs both positives and negatives)
+2. Trains a fresh logistic regression model
+3. Extracts feature coefficients and the intercept (as plain Python floats)
+4. Computes accuracy via `model.transform()` (used only after training, not on raw rows)
+5. Prints a clean summary with visual bars for coefficient magnitudes and a sigmoid-transformed intercept
 
 The `trigger(processingTime="10 seconds")` setting means Spark waits up to 10 seconds per batch, accumulating more events for meaningful training.
+
+### Load Test (`loadtest.py`)
+
+High-throughput synthetic data generator. Key design points:
+
+- **4 worker threads × 4 async producers per thread = 16 concurrent Kafka producers** — keeps the network saturated
+- **Shared session pool** across all threads (protected by a lock) — events have a 5% chance of starting a new session, 95% chance of extending an existing one
+- **Realistic purchase signal** — purchase probability scales with how many events the user has already produced in the session (so `clicks_in_session` is a real feature the model can learn)
+- **aiokafka + `asyncio.gather()`** for high throughput (not the lower-level `send_batch`, which has a different API in aiokafka 0.14)
+- **On-the-fly generation** — events are created in memory and discarded, so 5 GB doesn't require 5 GB of RAM
+- **Live progress reporter** — prints MB/s, events/s, and total bytes every 2 seconds
+
+Tunable parameters at the top of the file: `TARGET_BYTES`, `NUM_WORKERS`, `TASKS_PER_WORKER`, `MAX_ACTIVE_SESSIONS`, `NEW_SESSION_PROBABILITY`, `BASE_PURCHASE_PROBABILITY`, `PURCHASE_SCALING`.
+
+Measured throughput on Apple M1 8-core: ~9.6 MB/s, ~85k events/sec with no lock contention (the simpler version) and ~3.3 MB/s after adding the session pool (the lock is the bottleneck).
 
 ---
 
@@ -229,13 +285,16 @@ The `trigger(processingTime="10 seconds")` setting means Spark waits up to 10 se
 | Concept | Where |
 |---|---|
 | Event-driven architecture | Producer → Kafka → Consumer pattern |
-| Topics and partitions | `clickstream_v2` topic |
+| Topics and partitions | `clickstream_v2` and `clickstream_loadtest` topics |
 | Serialization | JSON encoding for Kafka transport |
 | Group offsets and replay | `group_id` parameter on the consumer |
+| Asynchronous production | `aiokafka` + `asyncio.gather` in `loadtest.py` |
+| Multi-threaded fan-out | `ThreadPoolExecutor` + per-thread `asyncio.run` in `loadtest.py` |
 | Micro-batch processing | Spark's `processingTime` trigger |
 | Stateful stream processing | Windowed aggregations in `featurize` |
 | Continuous machine learning | `foreachBatch` retrains on every batch |
 | Online vs batch learning | Logistic regression fit on each micro-batch |
+| `startingOffsets` strategies | `earliest` for replay, `latest` for live training |
 
 ---
 
@@ -247,11 +306,12 @@ Kafka isn't reachable. Check `docker ps` and confirm both containers are up.
 ### `UnsupportedClassVersionError`
 Java version mismatch. Spark 3.5 requires Java 8/11/17. Use `java -version` to verify, and set `JAVA_HOME` to point at JDK 17.
 
-### `JAVA_GATEWAY_EXITED`
-JAVA_HOME isn't reaching Python. Set it in the same shell:
+### `JAVA_GATEWAY_EXITED` (or `spark-class: Operation timed out`)
+JAVA_HOME isn't reaching Python, or the JVM is taking too long to start. Try:
 
 ```bash
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)
+export PYSPARK_GATEWAY_TIMEOUT=300    # default is 60s, too short on some systems
 ```
 
 ### `ModuleNotFoundError: No module named 'distutils'`
@@ -270,20 +330,31 @@ Calling Spark operations (like `model.transform()`) inside `foreachBatch` trigge
 ### Spark 4.x Kafka metrics NullPointerException
 Spark 4.1.2 has a known bug with the Kafka 0-10 connector that crashes the streaming query after a few batches. **Use Spark 3.5.1** to avoid this.
 
+### `LogisticRegression: requirement failed: Nothing has been added to this summarizer`
+The batch contains only one class (all purchases or all non-purchases). The current `process_batch` skips such batches gracefully. If you see this in your own code, add a label check or undersample.
+
+### Spark produces no output for several minutes
+Most often caused by `startingOffsets=earliest` combined with a topic that already has millions of events. The first batch will be huge and take a long time. Use `startingOffsets=latest` to only see new events.
+
+### `aiokafka` `send_batch` API quirks
+`AIOKafkaProducer.send_batch()` in aiokafka 0.14 expects a `BatchBuilder` object, not a list of payloads. For high throughput, use `send()` in a loop and `asyncio.gather()` to wait for the batch — the producer still batches on the wire via `linger_ms` and `max_batch_size`.
+
 ---
 
 ## What's Next
 
 Some natural extensions if you want to keep building:
 
-- **Broadcast variables** for proper model persistence across batches
-- **River library** for true per-event online learning
+- **River library** for true per-event online learning (one update per event, not one model per batch)
 - **Schema registry** to manage the JSON schema externally
-- **Model persistence** — save trained model to disk and reload
+- **Model persistence** — save trained model to disk and reload (currently the model only lives in memory for one batch)
 - **Multi-class prediction** — view / click / purchase instead of binary
+- **More features** — `url` one-hot encoding, `amount` for purchases, day-of-week from `timestamp`
+- **Class imbalance handling** — undersample non-purchases or use class weights in `LogisticRegression`
 - **Unit tests** for each class
 - **Dockerfile** to containerize the entire pipeline
 - **Monitoring dashboard** with Prometheus + Grafana
+- **Long-running model** — accumulate coefficients across batches instead of refitting from scratch (use a small learning rate)
 
 ---
 
