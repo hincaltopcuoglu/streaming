@@ -1,47 +1,100 @@
 """Run the streaming pipeline with continuous online ML training.
 
+This pipeline uses TRUE online learning: the model carries its weights
+across batches and updates them with one small gradient-descent step
+per batch. It is not "mini-batch refitting" - the model does not forget
+what it learned from previous batches.
+
 Each micro-batch:
-  1. Trains a fresh logistic regression model on the parsed events
-  2. Extracts coefficients (feature importances) - safe Python values
-  3. Computes model accuracy on the training batch via Spark SQL only
-  4. Prints a clean summary
+  1. Either bootstraps weights with a full fit (cold start) or does ONE
+     SGD step on the batch to update existing weights in place.
+  2. Extracts the current weights and intercept as plain Python floats.
+  3. Computes accuracy by applying the current weights to the batch.
+  4. Prints a clean summary.
+
+Compare to the alternative: refitting a fresh model on each batch
+makes the model "forget" everything outside the current window
+(catastrophic forgetting) and is sensitive to noise in any single batch.
 """
 from processor import StreamProcessor
 from model import OnlinePurchasePredictor
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col as c
+import math
 import sys
 
 TOPIC = sys.argv[1] if len(sys.argv) > 1 else "clickstream_v2"
 CHECKPOINT_DIR = f"/tmp/spark-checkpoint-{TOPIC}"
 
+# The online model is a module-level singleton. Its weights and intercept
+# survive across batches - this is the whole point of true online learning.
+_online_model = None
+
+
+def get_online_model():
+    """Return the persistent OnlinePurchasePredictor instance.
+
+    Created lazily on first call. Subsequent calls return the same object
+    with its accumulated weights.
+    """
+    global _online_model
+    if _online_model is None:
+        _online_model = OnlinePurchasePredictor(learning_rate=0.05, l2_reg=0.01)
+    return _online_model
+
 
 def extract_feature_importance(model):
-    """Extract logistic regression coefficients and intercept as a dict.
+    """Extract weights and intercept as a dict {feature_name: value}.
 
-    Coefficients and intercept are simple Python floats - safe to pass around.
+    Weights are simple Python floats - safe to pass around.
     """
     try:
-        coeffs = model.model.coefficients
         feature_names = model.assembler.getInputCols()
-        result = {name: float(coeffs[i]) for i, name in enumerate(feature_names)}
-        # Add the intercept - it captures the class baseline probability.
-        # If coefficients are all 0, the model only uses the intercept.
-        result["__intercept__"] = float(model.model.interceptVector[0])
+        result = {name: float(model.weights[i]) for i, name in enumerate(feature_names)}
+        result["__intercept__"] = float(model.intercept)
         return result
     except Exception as e:
         return {"error": str(e)}
 
 
 def compute_training_accuracy(model, batch_df):
-    """Compute accuracy using Spark SQL transforms only (no driver-side collect)."""
+    """Apply the current weights to the batch and measure accuracy.
+
+    Uses a Spark UDF to apply the current weights and intercept on the
+    executor side, then compares predictions to labels in SQL. No
+    driver-side collect, no nested SparkContext.
+    """
     try:
+        if model.weights is None:
+            return None
+
+        from pyspark.sql.functions import udf, col as c, sum as smax
+        from pyspark.sql.types import DoubleType
+
+        # Snapshot weights and intercept for the UDF (must be picklable)
+        weights_list = list(model.weights)
+        intercept_val = float(model.intercept)
+
+        def predict(features):
+            # features is a pyspark.ml.linalg.Vector
+            z = intercept_val + sum(weights_list[i] * features[i] for i in range(len(weights_list)))
+            # Sigmoid
+            if z >= 0:
+                p = 1.0 / (1.0 + 2.718281828 ** (-z))
+            else:
+                ez = 2.718281828 ** z
+                p = ez / (1.0 + ez)
+            return float(1.0 if p >= 0.5 else 0.0)
+
+        predict_udf = udf(predict, DoubleType())
+
         featurized = model.featurize(batch_df)
         assembled = model.assembler.transform(featurized)
-        predictions = model.model.transform(assembled)
+        predictions = assembled.withColumn(
+            "pred", predict_udf(c("features"))
+        )
 
-        from pyspark.sql.functions import col as c, sum as smax
         result = predictions.withColumn(
-            "is_correct", (c("prediction") == c("label")).cast("int")
+            "is_correct", (c("pred") == c("label")).cast("int")
         ).agg(smax("is_correct").alias("correct")).collect()[0]
 
         correct = result["correct"] or 0
@@ -78,8 +131,9 @@ def process_batch(batch_df, batch_id):
                   f"positives={positives}, negatives={negatives}, total={event_count})")
             return
 
-        # 1) Train fresh model on this batch
-        model = OnlinePurchasePredictor()
+        # 1) Update the persistent online model with one SGD step on this batch.
+        # The model is a module-level singleton so its weights survive across batches.
+        model = get_online_model()
         model.train_on_batch(batch_df)
 
         # 2) Gather metrics - all simple Python values, safe to print
@@ -88,13 +142,14 @@ def process_batch(batch_df, batch_id):
 
         # 3) Print a clean summary
         print(f"\n{'=' * 60}")
-        print(f"Batch {batch_id}  |  events: {event_count}")
+        print(f"Batch {batch_id}  |  events: {event_count}  |  model update #{model.update_count}")
         print(f"{'=' * 60}")
         if accuracy is not None:
             print(f"Accuracy on this batch: {accuracy:.3f}")
         else:
             print(f"Accuracy: could not compute")
-        print(f"Feature importances (coefficients):")
+        print(f"Current weights (carried across batches, updated by one SGD step per batch):")
+        
         if "error" not in importance:
             intercept = importance.pop("__intercept__", None)
             for feature, weight in importance.items():

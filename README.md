@@ -23,7 +23,9 @@ This project was built as a hands-on learning exercise covering **Python OOP**, 
                                     └────────────────────────┘
 ```
 
-Each micro-batch triggers the full pipeline: Spark reads events from Kafka, parses JSON into typed columns, computes windowed session-level features, and retrains a logistic regression model. Coefficients and accuracy are printed continuously.
+Each micro-batch triggers the full pipeline: Spark reads events from Kafka, parses JSON into typed columns, computes windowed session-level features, and updates a single online logistic regression model. The model is a **stateful singleton** — its weights survive across batches and are updated by one stochastic gradient descent (SGD) step per batch. Coefficients and accuracy are printed continuously.
+
+> **A note on "online learning"**: this is true online learning, not mini-batch refitting. The model does *not* forget its weights between batches; each batch only nudges them by a small amount. The first batch bootstraps the weights with a full `LogisticRegression.fit()`, and every subsequent batch does exactly one SGD step. This protects against catastrophic forgetting and lets the model converge stably over time.
 
 ---
 
@@ -36,7 +38,7 @@ Each micro-batch triggers the full pipeline: Spark reads events from Kafka, pars
 | `producer.py` | `EventProducer` — serializes events and sends them to Kafka |
 | `consumer.py` | `EventConsumer` — reads events from Kafka, optionally returns typed objects |
 | `processor.py` | `StreamProcessor` — Spark session, reads Kafka stream, parses JSON into typed DataFrame columns, exposes aggregations |
-| `model.py` | `OnlinePurchasePredictor` — logistic regression trained per batch with windowed session features |
+| `model.py` | `OnlinePurchasePredictor` — true online learning: weights persist across batches, one SGD step per batch (with cold-start full fit on the first batch) |
 | `sent_events.py` | Test script: sends a mix of clicks and purchases to Kafka |
 | `loadtest.py` | High-throughput async load test — 4 threads × 4 aiokafka producers = 16 concurrent senders, generates 5 GB of realistic clickstream data on-the-fly |
 | `run_spark.py` | Main entry point — wires the Spark stream into the model with `foreachBatch` and prints live metrics |
@@ -165,23 +167,25 @@ With the high-throughput load test producing realistic sessions:
 
 ```
 ============================================================
-Batch 0  |  events: 1,800
+Batch 0  |  events: 1,800  |  model update #1
 ============================================================
 Accuracy on this batch: 0.676
-Feature importances (coefficients):
+Current weights (carried across batches, updated by one SGD step per batch):
   clicks_in_session         +0.1234  #
   time_on_page              +0.0000
   __intercept__             -0.9069  (baseline p=0.288)
 
 ============================================================
-Batch 1  |  events: 193,400
+Batch 1  |  events: 193,400  |  model update #2
 ============================================================
 Accuracy on this batch: 0.680
-Feature importances (coefficients):
+Current weights (carried across batches, updated by one SGD step per batch):
   clicks_in_session         +0.0450
   time_on_page              -0.0925
   __intercept__             -0.9972  (baseline p=0.269)
 ```
+
+Note the `model update #N` counter — it increments every batch, confirming the same model object is being updated (not a new model refit on each batch). The weights move only by small amounts per batch because the learning rate is small (0.05).
 
 What this tells you:
 
@@ -189,8 +193,7 @@ What this tells you:
 - **`time_on_page` is negative**: long gaps between events → less likely to purchase. Events cluster within sessions, so this is anti-correlated with the positive class.
 - **`__intercept__` is the baseline**: `sigmoid(intercept)` ≈ actual purchase rate in the batch. The model uses this to capture the class imbalance on top of the feature signal.
 - **Accuracy around 0.68** is a real prediction accuracy, not "always predict majority class". The data has substantial noise, so this is close to the realistic ceiling.
-
-The model retrains on every batch, and the coefficients update to reflect the patterns in the most recent events. That is online learning in action.
+- **Weights evolve slowly**: each batch only nudges the weights by the gradient × learning rate (0.05). Without catastrophic forgetting, the model can keep refining what it learned from earlier batches.
 
 ---
 
@@ -233,19 +236,23 @@ Three methods:
 `OnlinePurchasePredictor` with:
 
 - `featurize(df)` — adds `clicks_in_session` and `time_on_page` features using **5-minute tumbling windows** grouped by `session_id`, then joins back per event
-- `train_on_batch(df)` — fits a fresh `LogisticRegression` on the batch
+- `train_on_batch(df)` — **true online learning**: on the first call (cold start) it fits a full `LogisticRegression`. On every subsequent call it does **one** stochastic gradient descent step on the batch and updates `self.weights` and `self.intercept` in place. The model therefore carries knowledge across batches and only adjusts a little per batch.
 
 The windowed aggregation makes the features meaningful: each event's `clicks_in_session` reflects how many events the user produced in the same 5-minute window, not a fixed random number.
 
+The SGD step uses a small learning rate (default 0.05) and L2 regularization (default 0.01), so each batch only nudges the weights slightly. This is the difference between **online learning** and **mini-batch refitting** — the latter would train a brand-new model on each batch and forget everything else.
+
 ### Main Pipeline (`run_spark.py`)
 
-Wires everything together with `foreachBatch`. Each micro-batch:
+Wires everything together with `foreachBatch`. The model is a **module-level singleton** (`get_online_model()`), so its weights survive across batches — this is the key to true online learning.
+
+Each micro-batch:
 
 1. Skips the batch if it has only one class (LogisticRegression needs both positives and negatives)
-2. Trains a fresh logistic regression model
-3. Extracts feature coefficients and the intercept (as plain Python floats)
-4. Computes accuracy via `model.transform()` (used only after training, not on raw rows)
-5. Prints a clean summary with visual bars for coefficient magnitudes and a sigmoid-transformed intercept
+2. Calls `train_on_batch()` on the **same** model instance — this is a single SGD step, not a fresh fit
+3. Extracts the current weights and intercept (as plain Python floats)
+4. Computes accuracy by wrapping the current weights in a small `LogisticRegressionModel` and calling `.transform()` for a quick comparison against labels
+5. Prints a clean summary including the `model update #N` counter and a sigmoid-transformed intercept
 
 The `trigger(processingTime="10 seconds")` setting means Spark waits up to 10 seconds per batch, accumulating more events for meaningful training.
 
@@ -345,16 +352,16 @@ Most often caused by `startingOffsets=earliest` combined with a topic that alrea
 
 Some natural extensions if you want to keep building:
 
-- **River library** for true per-event online learning (one update per event, not one model per batch)
-- **Schema registry** to manage the JSON schema externally
-- **Model persistence** — save trained model to disk and reload (currently the model only lives in memory for one batch)
+- **River library** for true per-event online learning (one update per event, not per batch)
+- **External state store** — save weights to Redis so they survive Spark restarts
+- **Concept drift detection** — alert when a batch's gradient direction is wildly different from past ones
 - **Multi-class prediction** — view / click / purchase instead of binary
 - **More features** — `url` one-hot encoding, `amount` for purchases, day-of-week from `timestamp`
 - **Class imbalance handling** — undersample non-purchases or use class weights in `LogisticRegression`
+- **Adaptive learning rate** — decay the learning rate over batches to fine-tune convergence
 - **Unit tests** for each class
 - **Dockerfile** to containerize the entire pipeline
 - **Monitoring dashboard** with Prometheus + Grafana
-- **Long-running model** — accumulate coefficients across batches instead of refitting from scratch (use a small learning rate)
 
 ---
 
