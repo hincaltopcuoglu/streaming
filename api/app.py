@@ -94,8 +94,15 @@ def get_predictions(
 
     w = snap["weights"]
     b = snap["intercept"]
+    # Spark'taki feature engineering ile aynı: time_on_page = total_events in session
+    # (saniye cinsinden değil — Spark bunu zaten normalize ediyor)
     z = b + w[0] * clicks_in_session + w[1] * time_on_page
-    p = 1.0 / (1.0 + math.exp(-z))
+    # Numerically stable sigmoid: avoid overflow when z is very negative
+    if z >= 0:
+        p = 1.0 / (1.0 + math.exp(-z))
+    else:
+        ez = math.exp(z)
+        p = ez / (1.0 + ez)
     return PredictionOut(model_ready=True, purchase_probability=p)
 
 

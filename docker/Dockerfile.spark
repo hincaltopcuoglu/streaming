@@ -21,7 +21,6 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 # Spark job'ın ihtiyacı olan dosyalar
-COPY models.py factory.py ./
 COPY api/state.py api/cli.py ./api/
 COPY spark/ ./spark/
 

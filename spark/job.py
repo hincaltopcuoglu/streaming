@@ -70,15 +70,17 @@ schema = StructType([
 ])
 
 def featurize(df):
-    df_w  = df.withColumn("event_window", window(col("timestamp"), "5 minutes"))
-    agg = df_w.groupBy("event_window", "session_id").agg(
-        count("*").alias("clicks_in_session"),
+    """Her session için TEK SATIR üretir (session-level features).
+    Event-level olsaydı: büyük session'da 15 click + 1 purchase = 15 satır label=0 + 1 satır label=1
+    → model class imbalance öğrenirdi.
+    Session-level: 1 satır clicks_in_session + time_on_page + label(0/1)
+    → model gerçek korelasyonu öğrenir.
+    """
+    df_w = df.withColumn("event_window", window(col("timestamp"), "5 minutes"))
+    return df_w.groupBy("event_window", "session_id").agg(
+        count(when(col("action") == "click", lit(1))).alias("clicks_in_session"),
         (max(col("timestamp").cast("long")) - min(col("timestamp").cast("long"))).alias("time_on_page"),
-    )
-    enriched = df_w.join(agg, on=["event_window", "session_id"], how="left")
-    return enriched.withColumn(
-        "label",
-        when(col("action") == "purchase", lit(1)).otherwise(lit(0)),
+        max(when(col("action") == "purchase", lit(1)).otherwise(lit(0))).alias("label"),
     )
 
 

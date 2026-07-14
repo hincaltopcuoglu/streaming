@@ -7,8 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Önce paylaşılan modüller, sonra API kodu
-COPY models.py factory.py ./
+# API kodu
 COPY api/ ./api/
 
 ENV PYTHONUNBUFFERED=1
