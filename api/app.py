@@ -21,15 +21,29 @@ TOPIC = os.getenv("TOPIC", "clickstream_v2")
 
 @asynccontextmanager
 async def lifespan(app):
-    """Startup: Create Kafka Producer. Shutdown: close."""
+    """Startup: try to create Kafka Producer (lazy, don't crash if Kafka is down).
+    Shutdown: close if it exists."""
     log.info("Kafka=%s topic=%s", KAFKA_BOOTSTRAP, TOPIC)
-    app.state.kafka_producer = KafkaProducer(bootstrap_servers = KAFKA_BOOTSTRAP)
+    try:
+        app.state.kafka_producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            request_timeout_ms=5000,
+            api_version_auto_timeout_ms=5000,
+        )
+        log.info("Kafka producer ready")
+    except Exception as e:
+        log.warning("Kafka producer init failed: %s — running without producer", e)
+        app.state.kafka_producer = None
     try:
         yield
     finally:
-        log.info("Flushing Kafka Producer")
-        app.state.kafka_producer.flush()
-        app.state.kafka_producer.close()
+        if app.state.kafka_producer is not None:
+            log.info("Flushing Kafka Producer")
+            try:
+                app.state.kafka_producer.flush(timeout=5)
+                app.state.kafka_producer.close(timeout=5)
+            except Exception as e:
+                log.warning("Kafka close failed: %s", e)
 
 app = FastAPI(title="ClickStream API", version="2.0", lifespan=lifespan)
 
@@ -38,9 +52,12 @@ app = FastAPI(title="ClickStream API", version="2.0", lifespan=lifespan)
 @app.post("/events")
 def post_event(body: EventIn, request: Request):
     """Get Body, convert to dictionary, write to Kafka."""
+    producer = request.app.state.kafka_producer
+    if producer is None:
+        raise HTTPException(status_code=503, detail="Kafka producer not ready")
     payload = body.model_dump()
     data = json.dumps(payload).encode("utf-8")
-    request.app.state.kafka_producer.send(TOPIC, value=data)
+    producer.send(TOPIC, value=data)
     return {"status": "accepted", "topic": TOPIC}
 
 
