@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+# Spark 3.5.x için Java 17 lazım. Debian Trixie'de openjdk-17 paketi yok,
+# o yüzden Eclipse Adoptium (Temurin) 17'yi kendimiz indiriyoruz.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && mkdir -p /opt/java \
+    && curl -fsSL "https://api.adoptium.net/v3/binary/latest/17/ga/linux/aarch64/jdk/hotspot/normal/eclipse?project=jdk" -o /tmp/jdk.tar.gz \
+    && tar -xzf /tmp/jdk.tar.gz -C /opt/java --strip-components=1 \
+    && rm -rf /tmp/jdk.tar.gz /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/opt/java \
+    PATH=/opt/java/bin:$PATH \
+    PYSPARK_GATEWAY_TIMEOUT=300 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Spark job'ın ihtiyacı olan dosyalar
+COPY models.py factory.py ./
+COPY api/state.py api/cli.py ./api/
+COPY spark/ ./spark/
+
+CMD ["python", "spark/job.py"]

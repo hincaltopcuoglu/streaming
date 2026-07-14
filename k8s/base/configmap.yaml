@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickstream-config
+  namespace: clickstream
+data:
+  KAFKA_BOOTSTRAP: "kafka:9092"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  TOPIC: "clickstream_v2"
+  LOG_LEVEL: "INFO"
+  # Spark job için (job.py bunları kullanıyor)
+  LEARNING_RATE: "0.05"
+  L2_REG: "0.01"
